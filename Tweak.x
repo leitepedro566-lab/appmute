@@ -29,14 +29,13 @@
 
 @interface SBApplication : NSObject
 - (NSString *)bundleIdentifier;
-- (void)_didSuspend; // 全版本自带的退出挂起瞬时方法
 @end
 
 @interface SBVolumeControl : NSObject
 + (instancetype)sharedInstance; // 仅 iOS 14-15
 - (void)setVolume:(float)volume forCategory:(NSString *)category;
 - (void)setActiveCategoryVolume:(float)volume;
-- (float)_effectiveVolume; // 获取当前真实音量
+- (float)_effectiveVolume; // 全版本获取当前音量方法
 @end
 
 @interface SpringBoard : UIApplication
@@ -71,8 +70,7 @@ static NSString * GetPrefPath() {
 @property (nonatomic, assign) float savedVolume;             // 记录进入前的原音量
 @property (nonatomic, assign) BOOL isCurrentlyMuted;         // 当前是否处于代码强制静音状态
 + (instancetype)sharedManager;
-- (void)checkAppTransition;
-- (void)forceRestoreVolume;
+- (void)checkAppTransitionWithBundleID:(NSString *)currentBundleID;
 @end
 
 @implementation AppMuteManager
@@ -120,10 +118,10 @@ static NSString * GetPrefPath() {
 - (SBVolumeControl *)safeVolumeControl {
     SpringBoard *sb = (SpringBoard *)[UIApplication sharedApplication];
     if ([sb respondsToSelector:@selector(volumeControl)]) {
-        return sb.volumeControl; // iOS 16-17
+        return sb.volumeControl; // iOS 16-17 走这里
     }
     if ([%c(SBVolumeControl) respondsToSelector:@selector(sharedInstance)]) {
-        return [%c(SBVolumeControl) sharedInstance]; // iOS 14-15
+        return [%c(SBVolumeControl) sharedInstance]; // iOS 14-15 走这里
     }
     return nil;
 }
@@ -160,40 +158,33 @@ static NSString * GetPrefPath() {
     });
 }
 
-// 核心原汁原味恢复逻辑（去除了任何兜底值和修改值）
-- (void)forceRestoreVolume {
-    if (self.isCurrentlyMuted) {
-        if (self.savedVolume >= 0.0) {
-            [self setSystemVolume:self.savedVolume]; // 100% 精准原值恢复
-        }
-        self.isCurrentlyMuted = NO;
-        self.savedVolume = -1.0;
-        self.lastFrontmostBundleID = nil; // 及时重置状态旗帜
-    }
-}
-
 // 核心前后台切换检查逻辑
-- (void)checkAppTransition {
-    SpringBoard *sb = (SpringBoard *)[UIApplication sharedApplication];
-    SBApplication *app = [sb respondsToSelector:@selector(_accessibilityFrontMostApplication)] ? [sb _accessibilityFrontMostApplication] : nil;
-    NSString *currentBundleID = app ? [app bundleIdentifier] : nil;
+- (void)checkAppTransitionWithBundleID:(NSString *)currentBundleID {
     
-    if (currentBundleID != self.lastFrontmostBundleID && ![currentBundleID isEqualToString:self.lastFrontmostBundleID]) {
+    BOOL isSameApp = (currentBundleID == self.lastFrontmostBundleID) || 
+                     (currentBundleID && self.lastFrontmostBundleID && [currentBundleID isEqualToString:self.lastFrontmostBundleID]);
+    
+    if (!isSameApp) {
         
-        // 1. 判断是否【离开】了静音名单的 App（针对现代系统或应用间直接切换）
+        // 1. 判断是否【离开】了静音名单的 App
         if (self.isCurrentlyMuted) {
-            [self forceRestoreVolume];
+            // 完美原值精准恢复，去除了任何加减操作与硬编码兜底
+            if (self.savedVolume >= 0.0) {
+                [self setSystemVolume:self.savedVolume]; 
+            }
+            self.isCurrentlyMuted = NO;
+            self.savedVolume = -1.0;
         }
         
         // 2. 判断是否【进入】了静音名单的 App
         if (currentBundleID && [self isMuted:currentBundleID]) {
             SBVolumeControl *volCtrl = [self safeVolumeControl];
             if ([volCtrl respondsToSelector:@selector(_effectiveVolume)]) {
-                self.savedVolume = [volCtrl _effectiveVolume]; // 精确保存最原本的音量
+                self.savedVolume = [volCtrl _effectiveVolume]; // 原汁原味抓取极度精准的当前媒体音量
             }
             
             self.isCurrentlyMuted = YES;
-            [self setSystemVolume:0.0]; // 强行静音
+            [self setSystemVolume:0.0]; // 强行压制静音
         }
         
         self.lastFrontmostBundleID = currentBundleID;
@@ -246,31 +237,34 @@ static NSString * GetPrefPath() {
 
 
 %hook SpringBoard
-// 保持原有即时生效逻辑，不引入任何延时
+
+// 针对现代系统 (iOS 16-17) 的高能监听点
 - (void)_handleApplicationProcessStateDidChangeNotification:(NSNotification *)notification {
     %orig;
-    [[AppMuteManager sharedManager] checkAppTransition];
-}
-
-- (void)frontDisplayDidChange:(id)arg1 {
-    %orig;
-    [[AppMuteManager sharedManager] checkAppTransition];
-}
-%end
-
-
-// 【新增核心 Hook 点】：完美狙击 iOS 14 退出挂起不恢复的系统级缺陷
-%hook SBApplication
-- (void)_didSuspend {
-    %orig;
-    // 如果当前处于静音压制状态，并且正是被静音的 App 触发了退出挂起，立刻无延迟恢复
-    if ([[AppMuteManager sharedManager] isCurrentlyMuted]) {
-        NSString *bundleID = [self bundleIdentifier];
-        if (bundleID && [[AppMuteManager sharedManager] isMuted:bundleID]) {
-            [[AppMuteManager sharedManager] forceRestoreVolume]; // 瞬时恢复原值
-        }
+    SpringBoard *sb = (SpringBoard *)self;
+    // iOS 16-17 上此通知对应的 _accessibilityFrontMostApplication 是绝对同步且无滞后的，直接执行原有逻辑
+    if ([sb respondsToSelector:@selector(volumeControl)]) {
+        SBApplication *app = [sb respondsToSelector:@selector(_accessibilityFrontMostApplication)] ? [sb _accessibilityFrontMostApplication] : nil;
+        NSString *currentBundleID = app ? [app bundleIdentifier] : nil;
+        [[AppMuteManager sharedManager] checkAppTransitionWithBundleID:currentBundleID];
     }
 }
+
+// 针对早期系统 (iOS 14-15) 的绝对精准切换点
+- (void)frontDisplayDidChange:(id)arg1 {
+    %orig;
+    SpringBoard *sb = (SpringBoard *)self;
+    // iOS 14-15 上完全放弃全局读取，直接从参数 arg1 的底层实例中瞬时捞出当前真实前台状态
+    if (![sb respondsToSelector:@selector(volumeControl)]) {
+        NSString *currentBundleID = nil;
+        if (arg1 && [arg1 respondsToSelector:@selector(bundleIdentifier)]) {
+            currentBundleID = [arg1 bundleIdentifier];
+        }
+        // 当退出回到桌面时，arg1 变为非 App，currentBundleID 极其敏锐地沦为 nil，没有任何时间滞后地立刻原值恢复！
+        [[AppMuteManager sharedManager] checkAppTransitionWithBundleID:currentBundleID];
+    }
+}
+
 %end
 
 
