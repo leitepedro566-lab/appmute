@@ -7,7 +7,7 @@
 #define jbroot(path) path
 #endif
 
-// ================== 系统私有头文件声明 ==================
+// ================== 系统私有头文件精准声明 ==================
 @interface SBIcon : NSObject
 - (NSString *)applicationBundleID;
 - (BOOL)isApplicationIcon;
@@ -226,9 +226,12 @@ static NSString * GetPrefPath() {
     return mutOrig;
 }
 
-// 【修复误触跳转】使用 id 类型防止签名不匹配导致 Hook 失败，强制阻断系统默认跳转
+// 【修复编译错误】：把参数声明为 id，但在内部强转为 SBSApplicationShortcutItem
 + (void)activateShortcut:(id)shortcut withBundleIdentifier:(id)identifier forIconView:(id)view {
-    if ([shortcut respondsToSelector:@selector(type)] && [[shortcut type] isEqualToString:@"com.iosdump.appmute.toggle"]) {
+    // 强制转换类型，明确告诉编译器它有一个返回 NSString* 的 type 属性
+    SBSApplicationShortcutItem *item = (SBSApplicationShortcutItem *)shortcut;
+    
+    if ([item respondsToSelector:@selector(type)] && [item.type isEqualToString:@"com.iosdump.appmute.toggle"]) {
         // 1. 切换保存状态
         [[AppMuteManager sharedManager] toggleMute:identifier];
         // 2. 给用户一个轻微的震动反馈，表示点击成功
@@ -244,7 +247,7 @@ static NSString * GetPrefPath() {
 
 
 %hook SpringBoard
-// 【修复恢复功能 & 兼容全系统】无论是返回桌面、拉下控制中心，只要前台状态改变立刻触发校验
+// 兼容全系统：无论是返回桌面、拉下控制中心，只要前台状态改变立刻触发校验
 - (void)_handleApplicationProcessStateDidChangeNotification:(NSNotification *)notification {
     %orig;
     [[AppMuteManager sharedManager] checkAppTransition];
