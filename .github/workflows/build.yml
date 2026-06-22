@@ -1,4 +1,4 @@
-name: Build JumpSelect
+name: Build AppMute
 
 on:  
   workflow_dispatch:
