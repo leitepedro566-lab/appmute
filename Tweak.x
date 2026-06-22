@@ -25,6 +25,8 @@
 @property (nonatomic, copy) NSString *type;
 @property (nonatomic, copy) NSString *localizedTitle;
 @property (nonatomic, strong) id icon;
+@property (nonatomic, copy) NSString *bundleIdentifierToLaunch; // 修复 iOS 15 关键属性
+@property (nonatomic, assign) NSUInteger activationMode;        // 修复 iOS 15 关键属性
 @end
 
 @interface SBApplication : NSObject
@@ -95,7 +97,6 @@ static NSString * GetPrefPath() {
 }
 
 - (void)save {
-    // 【已修复】：这里补上了小括号 ()，确保传入的是路径字符串，而非函数指针
     [self.mutedBundleIDs writeToFile:GetPrefPath() atomically:YES];
     [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @0777, NSFileProtectionKey: NSFileProtectionNone} ofItemAtPath:GetPrefPath() error:nil];
 }
@@ -119,10 +120,10 @@ static NSString * GetPrefPath() {
 - (SBVolumeControl *)safeVolumeControl {
     SpringBoard *sb = (SpringBoard *)[UIApplication sharedApplication];
     if ([sb respondsToSelector:@selector(volumeControl)]) {
-        return sb.volumeControl; // iOS 16-17 走这里
+        return sb.volumeControl; // iOS 16-17
     }
     if ([%c(SBVolumeControl) respondsToSelector:@selector(sharedInstance)]) {
-        return [%c(SBVolumeControl) sharedInstance]; // iOS 14-15 走这里
+        return [%c(SBVolumeControl) sharedInstance]; // iOS 14-15
     }
     return nil;
 }
@@ -142,15 +143,17 @@ static NSString * GetPrefPath() {
         [mediaCtrl setSuppressHUD:YES];
     }
     
-    // 2. 调节音量
+    // 2. 调节音量 (双重分类保障 iOS 14-15)
     SBVolumeControl *volCtrl = [self safeVolumeControl];
-    if ([volCtrl respondsToSelector:@selector(setVolume:forCategory:)]) {
-        [volCtrl setVolume:targetVolume forCategory:@"Audio/Video"];
-    } else if ([volCtrl respondsToSelector:@selector(setActiveCategoryVolume:)]) {
+    if ([volCtrl respondsToSelector:@selector(setActiveCategoryVolume:)]) {
         [volCtrl setActiveCategoryVolume:targetVolume];
     }
+    if ([volCtrl respondsToSelector:@selector(setVolume:forCategory:)]) {
+        [volCtrl setVolume:targetVolume forCategory:@"Audio/Video"];
+        [volCtrl setVolume:targetVolume forCategory:@"Media"]; // 兼容旧版系统
+    }
     
-    // 3. 延时 0.5s 后恢复 HUD 弹窗能力
+    // 3. 延时恢复 HUD 弹窗能力，防止影响用户手动按物理键
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
         g_isMutingHUD = NO;
         if ([mediaCtrl respondsToSelector:@selector(setSuppressHUD:)]) {
@@ -161,42 +164,38 @@ static NSString * GetPrefPath() {
 
 // 核心前后台切换检查逻辑
 - (void)checkAppTransition {
-    SpringBoard *sb = (SpringBoard *)[UIApplication sharedApplication];
-    SBApplication *app = [sb respondsToSelector:@selector(_accessibilityFrontMostApplication)] ? [sb _accessibilityFrontMostApplication] : nil;
-    NSString *currentBundleID = app ? [app bundleIdentifier] : nil;
-    
-    if (currentBundleID != self.lastFrontmostBundleID && ![currentBundleID isEqualToString:self.lastFrontmostBundleID]) {
+    // 修复 iOS 14 状态机竞争导致返回桌面时读取前台应用不准的问题
+    dispatch_async(dispatch_get_main_queue(), ^{
+        SpringBoard *sb = (SpringBoard *)[UIApplication sharedApplication];
+        SBApplication *app = [sb respondsToSelector:@selector(_accessibilityFrontMostApplication)] ? [sb _accessibilityFrontMostApplication] : nil;
+        NSString *currentBundleID = app ? [app bundleIdentifier] : nil;
         
-        // 1. 判断是否【离开】了静音名单的 App
-        if (self.isCurrentlyMuted) {
-            if (self.savedVolume >= 0.0) {
-                [self setSystemVolume:self.savedVolume];
+        if (currentBundleID != self.lastFrontmostBundleID && ![currentBundleID isEqualToString:self.lastFrontmostBundleID]) {
+            
+            // 1. 判断是否【离开】了静音名单的 App
+            if (self.isCurrentlyMuted) {
+                if (self.savedVolume >= 0.0) {
+                    [self setSystemVolume:self.savedVolume];
+                }
+                self.isCurrentlyMuted = NO;
+                self.savedVolume = -1.0;
             }
-            self.isCurrentlyMuted = NO;
-            self.savedVolume = -1.0;
+            
+            // 2. 判断是否【进入】了静音名单的 App
+            if (currentBundleID && [self isMuted:currentBundleID]) {
+                // 防止连续状态切换导致将 0.0 错误地记录为原音量
+                if (!self.isCurrentlyMuted) {
+                    SBVolumeControl *volCtrl = [self safeVolumeControl];
+                    float currentVol = [volCtrl respondsToSelector:@selector(_effectiveVolume)] ? [volCtrl _effectiveVolume] : 0.5;
+                    self.savedVolume = currentVol; 
+                    self.isCurrentlyMuted = YES;
+                    [self setSystemVolume:0.0];
+                }
+            }
+            
+            self.lastFrontmostBundleID = currentBundleID;
         }
-        
-        // 2. 判断是否【进入】了静音名单的 App
-        if (currentBundleID && [self isMuted:currentBundleID]) {
-            SBVolumeControl *volCtrl = [self safeVolumeControl];
-            float currentVol = 0.5;
-            
-            if ([volCtrl respondsToSelector:@selector(_effectiveVolume)]) {
-                currentVol = [volCtrl _effectiveVolume];
-            }
-            
-            if (currentVol > 0.05) {
-                self.savedVolume = currentVol;
-            } else if (self.savedVolume < 0.0) {
-                self.savedVolume = 0.3;
-            }
-            
-            self.isCurrentlyMuted = YES;
-            [self setSystemVolume:0.0];
-        }
-        
-        self.lastFrontmostBundleID = currentBundleID;
-    }
+    });
 }
 @end
 
@@ -222,6 +221,14 @@ static NSString * GetPrefPath() {
     item.type = @"com.iosdump.appmute.toggle";
     item.localizedTitle = isMuted ? @"关闭启动静音" : @"开启启动静音";
     
+    // 【修复 iOS 15】必须显式设置 BundleID 和 ActivationMode，否则系统可能拒绝渲染或无响应
+    if ([item respondsToSelector:@selector(setBundleIdentifierToLaunch:)]) {
+        item.bundleIdentifierToLaunch = bundleID;
+    }
+    if ([item respondsToSelector:@selector(setActivationMode:)]) {
+        item.activationMode = 1; // 后台激活模式 (SBSApplicationShortcutActivationModeBackground)
+    }
+    
     SBSApplicationShortcutSystemIcon *sysIcon = [[%c(SBSApplicationShortcutSystemIcon) alloc] initWithSystemImageName: isMuted ? @"speaker.slash.fill" : @"speaker.wave.2.fill"];
     item.icon = sysIcon;
     
@@ -234,9 +241,13 @@ static NSString * GetPrefPath() {
     SBSApplicationShortcutItem *item = (SBSApplicationShortcutItem *)shortcut;
     
     if ([item respondsToSelector:@selector(type)] && [item.type isEqualToString:@"com.iosdump.appmute.toggle"]) {
+        // 1. 切换保存状态
         [[AppMuteManager sharedManager] toggleMute:identifier];
+        // 2. 给用户一个轻微的震动反馈，表示点击成功
         UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
         [feedback impactOccurred];
+        
+        // 3. 物理斩断唤起 App 的系统流程
         return; 
     }
     %orig;
@@ -245,24 +256,20 @@ static NSString * GetPrefPath() {
 
 
 %hook SpringBoard
+// 兼容全系统状态改变
 - (void)_handleApplicationProcessStateDidChangeNotification:(NSNotification *)notification {
     %orig;
     [[AppMuteManager sharedManager] checkAppTransition];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-        [[AppMuteManager sharedManager] checkAppTransition];
-    });
 }
 
+// 针对旧系统的前台切换监听
 - (void)frontDisplayDidChange:(id)arg1 {
     %orig;
     [[AppMuteManager sharedManager] checkAppTransition];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-        [[AppMuteManager sharedManager] checkAppTransition];
-    });
 }
 %end
 
-
+// 双保险：如果 SBMediaController.suppressHUD 失效，手动拦截底层 UI 弹窗
 %hook SBVolumeControl
 - (void)_presentVolumeHUDWithVolume:(float)volume {
     if (g_isMutingHUD) return;
