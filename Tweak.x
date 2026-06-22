@@ -32,10 +32,10 @@
 @end
 
 @interface SBVolumeControl : NSObject
-+ (instancetype)sharedInstance; // iOS 14-15
++ (instancetype)sharedInstance; // 仅 iOS 14-15
 - (void)setVolume:(float)volume forCategory:(NSString *)category;
 - (void)setActiveCategoryVolume:(float)volume;
-- (float)_effectiveVolume;
+- (float)_effectiveVolume; // 全版本都有的获取当前音量方法
 @end
 
 @interface SpringBoard : UIApplication
@@ -46,7 +46,7 @@
 @interface SBMediaController : NSObject
 + (instancetype)sharedInstance;
 + (instancetype)sharedInstanceIfExists; // iOS 17
-@property (nonatomic, assign) BOOL suppressHUD;
+@property (nonatomic, assign) BOOL suppressHUD; // 隐藏系统音量进度条
 @end
 
 // ================== 全局数据与状态管理 ==================
@@ -66,9 +66,9 @@ static NSString * GetPrefPath() {
 
 @interface AppMuteManager : NSObject
 @property (nonatomic, strong) NSMutableArray *mutedBundleIDs;
-@property (nonatomic, copy) NSString *lastFrontmostBundleID; 
-@property (nonatomic, assign) float savedVolume;             
-@property (nonatomic, assign) BOOL isCurrentlyMuted;         
+@property (nonatomic, copy) NSString *lastFrontmostBundleID; // 记录上一个前台App
+@property (nonatomic, assign) float savedVolume;             // 记录进入前的原音量
+@property (nonatomic, assign) BOOL isCurrentlyMuted;         // 当前是否处于代码强制静音状态
 + (instancetype)sharedManager;
 - (void)checkAppTransition;
 @end
@@ -95,7 +95,8 @@ static NSString * GetPrefPath() {
 }
 
 - (void)save {
-    [self.mutedBundleIDs writeToFile:GetPrefPath atomically:YES];
+    // 【已修复】：这里补上了小括号 ()，确保传入的是路径字符串，而非函数指针
+    [self.mutedBundleIDs writeToFile:GetPrefPath() atomically:YES];
     [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @0777, NSFileProtectionKey: NSFileProtectionNone} ofItemAtPath:GetPrefPath() error:nil];
 }
 
@@ -114,21 +115,23 @@ static NSString * GetPrefPath() {
     [self save];
 }
 
+// 跨版本安全获取 VolumeControl
 - (SBVolumeControl *)safeVolumeControl {
     SpringBoard *sb = (SpringBoard *)[UIApplication sharedApplication];
     if ([sb respondsToSelector:@selector(volumeControl)]) {
-        return sb.volumeControl; // iOS 16-17
+        return sb.volumeControl; // iOS 16-17 走这里
     }
     if ([%c(SBVolumeControl) respondsToSelector:@selector(sharedInstance)]) {
-        return [%c(SBVolumeControl) sharedInstance]; // iOS 14-15
+        return [%c(SBVolumeControl) sharedInstance]; // iOS 14-15 走这里
     }
     return nil;
 }
 
+// 通用设音量+隐藏弹窗逻辑
 - (void)setSystemVolume:(float)targetVolume {
     g_isMutingHUD = YES;
     
-    // 1. 拦截音量弹窗
+    // 1. 开启 HUD 隐藏
     SBMediaController *mediaCtrl = nil;
     if ([%c(SBMediaController) respondsToSelector:@selector(sharedInstance)]) {
         mediaCtrl = [%c(SBMediaController) sharedInstance];
@@ -139,7 +142,7 @@ static NSString * GetPrefPath() {
         [mediaCtrl setSuppressHUD:YES];
     }
     
-    // 2. 设置音量
+    // 2. 调节音量
     SBVolumeControl *volCtrl = [self safeVolumeControl];
     if ([volCtrl respondsToSelector:@selector(setVolume:forCategory:)]) {
         [volCtrl setVolume:targetVolume forCategory:@"Audio/Video"];
@@ -147,7 +150,7 @@ static NSString * GetPrefPath() {
         [volCtrl setActiveCategoryVolume:targetVolume];
     }
     
-    // 3. 延时恢复弹窗
+    // 3. 延时 0.5s 后恢复 HUD 弹窗能力
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
         g_isMutingHUD = NO;
         if ([mediaCtrl respondsToSelector:@selector(setSuppressHUD:)]) {
@@ -160,12 +163,11 @@ static NSString * GetPrefPath() {
 - (void)checkAppTransition {
     SpringBoard *sb = (SpringBoard *)[UIApplication sharedApplication];
     SBApplication *app = [sb respondsToSelector:@selector(_accessibilityFrontMostApplication)] ? [sb _accessibilityFrontMostApplication] : nil;
-    NSString *currentBundleID = app ? [app bundleIdentifier] : nil; 
+    NSString *currentBundleID = app ? [app bundleIdentifier] : nil;
     
-    // 只要前台 App 发生了变化，就进行对比处理
     if (currentBundleID != self.lastFrontmostBundleID && ![currentBundleID isEqualToString:self.lastFrontmostBundleID]) {
         
-        // 1. 判断是否【离开】了静音名单的 App (无论进入桌面 nil 还是其他 App)
+        // 1. 判断是否【离开】了静音名单的 App
         if (self.isCurrentlyMuted) {
             if (self.savedVolume >= 0.0) {
                 [self setSystemVolume:self.savedVolume];
@@ -177,25 +179,22 @@ static NSString * GetPrefPath() {
         // 2. 判断是否【进入】了静音名单的 App
         if (currentBundleID && [self isMuted:currentBundleID]) {
             SBVolumeControl *volCtrl = [self safeVolumeControl];
-            float currentVol = 0.5; // 默认值
+            float currentVol = 0.5;
             
             if ([volCtrl respondsToSelector:@selector(_effectiveVolume)]) {
                 currentVol = [volCtrl _effectiveVolume];
             }
             
-            // 【重要修复】：防御性保存。如果获取到的音量是 0，说明原本就是 0 或是 iOS14 状态没拿对
-            // 此时给定一个 30% 的兜底，防止退出时恢复成 0.0 导致感觉像“没恢复”。
             if (currentVol > 0.05) {
                 self.savedVolume = currentVol;
             } else if (self.savedVolume < 0.0) {
-                self.savedVolume = 0.3; 
+                self.savedVolume = 0.3;
             }
             
             self.isCurrentlyMuted = YES;
-            [self setSystemVolume:0.0]; // 强行拉到底
+            [self setSystemVolume:0.0];
         }
         
-        // 更新记录
         self.lastFrontmostBundleID = currentBundleID;
     }
 }
@@ -235,12 +234,9 @@ static NSString * GetPrefPath() {
     SBSApplicationShortcutItem *item = (SBSApplicationShortcutItem *)shortcut;
     
     if ([item respondsToSelector:@selector(type)] && [item.type isEqualToString:@"com.iosdump.appmute.toggle"]) {
-        // 1. 切换保存状态
         [[AppMuteManager sharedManager] toggleMute:identifier];
-        // 2. 给用户一个轻微的震动反馈
         UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
         [feedback impactOccurred];
-        // 3. 直接 return，阻止 App 启动
         return; 
     }
     %orig;
@@ -249,7 +245,6 @@ static NSString * GetPrefPath() {
 
 
 %hook SpringBoard
-// 【重要修复】：加入延时执行，完美解决 iOS 14 返回桌面瞬间状态未同步的 Bug
 - (void)_handleApplicationProcessStateDidChangeNotification:(NSNotification *)notification {
     %orig;
     [[AppMuteManager sharedManager] checkAppTransition];
@@ -268,19 +263,16 @@ static NSString * GetPrefPath() {
 %end
 
 
-// 拦截底层 UI 弹窗
 %hook SBVolumeControl
 - (void)_presentVolumeHUDWithVolume:(float)volume {
     if (g_isMutingHUD) return;
     %orig;
 }
-// 兼容 iOS 14-15 的显示逻辑
 - (void)_presentVolumeHUDIfDisplayable:(BOOL)displayable orRefreshIfPresentedWithReason:(id)reason {
     if (g_isMutingHUD) return;
     %orig;
 }
 %end
-
 
 // ================== 初始化构造 ==================
 %ctor {
