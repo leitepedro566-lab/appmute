@@ -29,20 +29,17 @@
 @property (nonatomic, assign) NSUInteger activationMode;        
 @end
 
-// iOS 14-17 全通道音频终极控制器
-@interface AVSystemController : NSObject
-+ (id)sharedAVSystemController;
-- (_Bool)getVolume:(float *)volume forCategory:(id)category;
-- (_Bool)setVolumeTo:(float)to forCategory:(id)category;
+// 负责安全的媒体音量控制
+@interface SBVolumeControl : NSObject
++ (instancetype)sharedInstance; // iOS 14-15
+- (void)setVolume:(float)volume forCategory:(NSString *)category; // iOS 14-17
+- (float)_effectiveVolume;
 @end
 
 @interface SBMediaController : NSObject
 + (instancetype)sharedInstance;
 + (instancetype)sharedInstanceIfExists; 
 @property (nonatomic, assign) BOOL suppressHUD;
-@end
-
-@interface SpringBoard : UIApplication
 @end
 
 
@@ -64,7 +61,7 @@ static NSString * GetPrefPath() {
 @interface AppMuteManager : NSObject
 @property (nonatomic, strong) NSMutableArray *mutedBundleIDs;
 @property (nonatomic, copy) NSString *lastFrontmostBundleID;
-@property (nonatomic, strong) NSMutableDictionary *savedVolumes; // 音量记忆缓存
+@property (nonatomic, assign) float savedMediaVolume;
 @property (nonatomic, assign) BOOL isCurrentlyMuted;
 + (instancetype)sharedManager;
 - (NSArray *)addShortcutToItems:(NSArray *)orig forIcon:(SBIcon *)icon;
@@ -87,7 +84,7 @@ static NSString * GetPrefPath() {
     if (self) {
         NSArray *saved = [NSArray arrayWithContentsOfFile:GetPrefPath()];
         self.mutedBundleIDs = saved ? [saved mutableCopy] : [NSMutableArray array];
-        self.savedVolumes = [NSMutableDictionary dictionary];
+        self.savedMediaVolume = -1.0;
         self.isCurrentlyMuted = NO;
         self.lastFrontmostBundleID = @"";
     }
@@ -114,75 +111,67 @@ static NSString * GetPrefPath() {
     [self save];
 }
 
-- (void)suppressMediaHUD:(BOOL)suppress {
-    id mediaCtrl = nil;
+// 核心安全获取 VolumeControl (完美兼容 iOS 14-17)
+- (SBVolumeControl *)safeVolumeControl {
+    if ([%c(SBVolumeControl) respondsToSelector:@selector(sharedInstance)]) {
+        return [%c(SBVolumeControl) sharedInstance]; // iOS 14-15
+    }
+    // iOS 16-17: 剥离了单例，但根据头文件发现它被 SBMediaController 持有
+    SBMediaController *mediaCtrl = nil;
     if ([%c(SBMediaController) respondsToSelector:@selector(sharedInstanceIfExists)]) {
         mediaCtrl = [%c(SBMediaController) sharedInstanceIfExists];
     } else if ([%c(SBMediaController) respondsToSelector:@selector(sharedInstance)]) {
         mediaCtrl = [%c(SBMediaController) sharedInstance];
     }
+    
+    if (mediaCtrl) {
+        @try {
+            id volCtrl = [mediaCtrl valueForKey:@"_volumeControl"];
+            if (volCtrl) return volCtrl;
+        } @catch (NSException *e) {}
+    }
+    return nil;
+}
+
+// 精准控制媒体音量，剔除对铃声的影响，拒绝主线程死锁
+- (void)setMediaVolume:(float)targetVolume saveCurrent:(BOOL)save {
+    g_isMutingHUD = YES;
+    
+    SBMediaController *mediaCtrl = nil;
+    if ([%c(SBMediaController) respondsToSelector:@selector(sharedInstanceIfExists)]) {
+        mediaCtrl = [%c(SBMediaController) sharedInstanceIfExists];
+    } else if ([%c(SBMediaController) respondsToSelector:@selector(sharedInstance)]) {
+        mediaCtrl = [%c(SBMediaController) sharedInstance];
+    }
+    
     if ([mediaCtrl respondsToSelector:@selector(setSuppressHUD:)]) {
-        [mediaCtrl setSuppressHUD:suppress];
+        [mediaCtrl setSuppressHUD:YES];
     }
-}
-
-// 开启静音（仅限媒体通道）
-- (void)performVolumeChangeToMute {
-    g_isMutingHUD = YES;
-    [self suppressMediaHUD:YES];
     
-    AVSystemController *avCtrl = [%c(AVSystemController) sharedAVSystemController];
-    if (avCtrl) {
-        // 仅处理媒体音量，剔除铃声(Ringtone)和系统音(System/Alarm)
-        NSArray *categories = @[@"Audio/Video", @"Media"];
+    SBVolumeControl *volCtrl = [self safeVolumeControl];
+    if (volCtrl && [volCtrl respondsToSelector:@selector(setVolume:forCategory:)]) {
         
-        if (!self.savedVolumes) self.savedVolumes = [NSMutableDictionary dictionary];
-        
-        for (NSString *cat in categories) {
-            float vol = 0.0;
-            if ([avCtrl respondsToSelector:@selector(getVolume:forCategory:)]) {
-                [avCtrl getVolume:&vol forCategory:cat];
-                // 仅当当前音量大于0时才保存，防止上一次的静音结果被误存
-                if (vol > 0.01) {
-                    self.savedVolumes[cat] = @(vol);
-                }
-            }
-            // 强制绝对静音
-            if ([avCtrl respondsToSelector:@selector(setVolumeTo:forCategory:)]) {
-                [avCtrl setVolumeTo:0.0 forCategory:cat];
+        // 如果是静音操作，先备份当前媒体音量
+        if (save && [volCtrl respondsToSelector:@selector(_effectiveVolume)]) {
+            float currentVol = [volCtrl _effectiveVolume];
+            if (currentVol > 0.01) {
+                self.savedMediaVolume = currentVol;
+            } else if (self.savedMediaVolume < 0) {
+                self.savedMediaVolume = 0.5; // 极小概率兜底
             }
         }
+        
+        // 仅干涉媒体分类，绝不影响电话和闹钟
+        [volCtrl setVolume:targetVolume forCategory:@"Media"];
+        [volCtrl setVolume:targetVolume forCategory:@"Audio/Video"];
     }
     
+    // 延时恢复 HUD 拦截
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         g_isMutingHUD = NO;
-        [self suppressMediaHUD:NO];
-    });
-}
-
-// 恢复音量（仅限媒体通道）
-- (void)performVolumeRestore {
-    g_isMutingHUD = YES;
-    [self suppressMediaHUD:YES];
-    
-    AVSystemController *avCtrl = [%c(AVSystemController) sharedAVSystemController];
-    if (avCtrl) {
-        NSArray *categories = @[@"Audio/Video", @"Media"];
-        for (NSString *cat in categories) {
-            float vol = 0.5; // 兜底安全音量
-            if (self.savedVolumes[cat]) {
-                vol = [self.savedVolumes[cat] floatValue];
-            }
-            if ([avCtrl respondsToSelector:@selector(setVolumeTo:forCategory:)]) {
-                [avCtrl setVolumeTo:vol forCategory:cat];
-            }
+        if ([mediaCtrl respondsToSelector:@selector(setSuppressHUD:)]) {
+            [mediaCtrl setSuppressHUD:NO];
         }
-        [self.savedVolumes removeAllObjects];
-    }
-    
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        g_isMutingHUD = NO;
-        [self suppressMediaHUD:NO];
     });
 }
 
@@ -194,13 +183,15 @@ static NSString * GetPrefPath() {
     if ([self isMuted:bundleID]) {
         if (!self.isCurrentlyMuted) {
             self.isCurrentlyMuted = YES;
-            [self performVolumeChangeToMute];
+            // 切换到静音并保存
+            [self setMediaVolume:0.0 saveCurrent:YES];
         }
     } else {
-        // 如果用户从【静音App】直接滑到了【非静音App】，也应立刻恢复
+        // 从名单内的App滑到名单外的App，立即恢复声音
         if (self.isCurrentlyMuted) {
             self.isCurrentlyMuted = NO;
-            [self performVolumeRestore];
+            float restoreVol = (self.savedMediaVolume >= 0.0) ? self.savedMediaVolume : 0.5;
+            [self setMediaVolume:restoreVol saveCurrent:NO];
         }
     }
 }
@@ -209,11 +200,11 @@ static NSString * GetPrefPath() {
 - (void)processAppBackground:(NSString *)bundleID {
     if (!bundleID || bundleID.length == 0) return;
     
-    // 如果退到后台的正是我们当前正在静音的 App，立刻解除静音
     if ([self.lastFrontmostBundleID isEqualToString:bundleID] && self.isCurrentlyMuted) {
         self.isCurrentlyMuted = NO;
-        self.lastFrontmostBundleID = @""; // 重置
-        [self performVolumeRestore];
+        self.lastFrontmostBundleID = @""; // 重置桌面状态
+        float restoreVol = (self.savedMediaVolume >= 0.0) ? self.savedMediaVolume : 0.5;
+        [self setMediaVolume:restoreVol saveCurrent:NO];
     }
 }
 
@@ -259,7 +250,6 @@ static NSString * GetPrefPath() {
 - (NSArray *)applicationShortcutItems {
     return [[AppMuteManager sharedManager] addShortcutToItems:%orig forIcon:self.icon];
 }
-
 - (NSArray *)effectiveApplicationShortcutItems {
     return [[AppMuteManager sharedManager] addShortcutToItems:%orig forIcon:self.icon];
 }
@@ -273,7 +263,6 @@ static NSString * GetPrefPath() {
                 NSString *bundleID = [icon applicationBundleID];
                 if (bundleID) {
                     [[AppMuteManager sharedManager] toggleMute:bundleID];
-                    // 主线程震动反馈，防止异常
                     dispatch_async(dispatch_get_main_queue(), ^{
                         UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
                         [feedback impactOccurred];
@@ -289,93 +278,40 @@ static NSString * GetPrefPath() {
 
 
 // ───────────────────────────────────────────
-//  [超强引擎] iOS 14-17 FrontBoard Scene 生命周期拦截
+//  [超强引擎] 防崩溃安全拦截 (解决系统App无效问题)
 // ───────────────────────────────────────────
 %hook SBMainDisplaySceneManager
 
 - (void)_noteDidChangeToVisibility:(unsigned long long)visibility previouslyExisted:(_Bool)existed forScene:(id)scene {
     %orig;
-    @try {
-        if ([scene respondsToSelector:@selector(clientProcess)]) {
-            // 使用 KVC 绕过编译期类型验证，绝对安全
-            id process = [scene valueForKey:@"clientProcess"];
-            if (process) {
-                NSString *bundleID = [process valueForKey:@"bundleIdentifier"];
-                if (bundleID && [bundleID isKindOfClass:[NSString class]]) {
-                    // FBSSceneVisibility: 2=前台可见, 0=销毁/未追踪, 1=后台
-                    if (visibility == 2) {
-                        [[AppMuteManager sharedManager] processAppForeground:bundleID];
-                    } else if (visibility == 0 || visibility == 1) {
-                        [[AppMuteManager sharedManager] processAppBackground:bundleID];
-                    }
+    // 异步执行，不阻碍 SpringBoard 核心渲染进程，彻底杜绝死锁引发的安全模式
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            NSString *bundleID = nil;
+            // 严谨校验类型，防止强解引发 Crash
+            if ([scene respondsToSelector:@selector(clientProcess)]) {
+                id process = [scene performSelector:@selector(clientProcess)];
+                if (process && [process respondsToSelector:@selector(bundleIdentifier)]) {
+                    bundleID = [process performSelector:@selector(bundleIdentifier)];
                 }
             }
-        }
-    } @catch (NSException *e) {
-        // 捕获可能因系统版本差异导致的 KVC 异常，防止安全模式
-    }
-}
-%end
-
-
-// ───────────────────────────────────────────
-//  [安全底线] 经典 SpringBoard 通知（应对老旧普通进程）
-// ───────────────────────────────────────────
-%hook SpringBoard
-
-- (void)frontDisplayDidChange:(id)change {
-    %orig;
-    @try {
-        NSString *newBundleID = nil;
-        if (change) {
-            if ([change respondsToSelector:@selector(applicationBundleID)]) {
-                newBundleID = [change performSelector:@selector(applicationBundleID)];
-            } else if ([change respondsToSelector:@selector(bundleIdentifier)]) {
-                newBundleID = [change performSelector:@selector(bundleIdentifier)];
-            } else {
-                id app = [change valueForKey:@"application"];
-                if ([app respondsToSelector:@selector(bundleIdentifier)]) {
-                    newBundleID = [app performSelector:@selector(bundleIdentifier)];
-                }
-            }
-        }
-        
-        if (!newBundleID) {
-            if ([self respondsToSelector:@selector(_accessibilityFrontMostApplication)]) {
-                id app = [self performSelector:@selector(_accessibilityFrontMostApplication)];
-                newBundleID = [app performSelector:@selector(bundleIdentifier)];
-            }
-        }
-        
-        if (newBundleID) {
-            [[AppMuteManager sharedManager] processAppForeground:newBundleID];
-        } else {
-            // newBundleID 为 nil 代表回到了桌面，触发后台恢复机制
-            [[AppMuteManager sharedManager] processAppBackground:[AppMuteManager sharedManager].lastFrontmostBundleID];
-        }
-    } @catch (NSException *e) {}
-}
-
-// 极旧版本的兼容保护
-- (void)_handleApplicationProcessStateDidChangeNotification:(NSNotification *)notification {
-    %orig;
-    @try {
-        if ([self respondsToSelector:@selector(_accessibilityFrontMostApplication)]) {
-            id app = [self performSelector:@selector(_accessibilityFrontMostApplication)];
-            if (app) {
-                NSString *bundleID = [app performSelector:@selector(bundleIdentifier)];
-                if (bundleID) {
+            
+            if (bundleID && [bundleID isKindOfClass:[NSString class]] && bundleID.length > 0) {
+                // FBSSceneVisibility: 2=前台可见, 0=销毁/未追踪, 1=后台
+                if (visibility == 2) {
                     [[AppMuteManager sharedManager] processAppForeground:bundleID];
+                } else if (visibility == 0 || visibility == 1) {
+                    [[AppMuteManager sharedManager] processAppBackground:bundleID];
                 }
             }
-        }
-    } @catch (NSException *e) {}
+        } @catch (NSException *e) {}
+    });
 }
 %end
 
 
 // ───────────────────────────────────────────
-//  阻止 HUD 弹出的双保险
+//  阻止 HUD 弹出的双保险 (仅针对媒体进度条)
 // ───────────────────────────────────────────
 %hook SBVolumeControl
 - (void)_presentVolumeHUDWithVolume:(float)volume {
