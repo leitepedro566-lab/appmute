@@ -168,10 +168,13 @@ static NSString * GetPrefPath() {
     NSString *bundleID = [icon applicationBundleID];
     if (!bundleID) return orig;
     
-    // 防重复注入
+    // 防重复注入 (修复了类型推断导致的编译错误)
     for (id item in orig) {
-        if ([item respondsToSelector:@selector(type)] && [[item type] isEqualToString:@"com.iosdump.appmute.toggle"]) {
-            return orig;
+        if ([item respondsToSelector:@selector(type)]) {
+            NSString *itemType = [(SBSApplicationShortcutItem *)item type];
+            if ([itemType isKindOfClass:[NSString class]] && [itemType isEqualToString:@"com.iosdump.appmute.toggle"]) {
+                return orig;
+            }
         }
     }
     
@@ -207,7 +210,8 @@ static NSString * GetPrefPath() {
         } else if ([change respondsToSelector:@selector(bundleIdentifier)]) {
             newBundleID = [change bundleIdentifier];
         } else if ([change respondsToSelector:@selector(application)]) {
-            id app = [change application];
+            // 修复了无方法声明导致的编译错误，改用 KVC 安全读取
+            id app = [change valueForKey:@"application"];
             if ([app respondsToSelector:@selector(bundleIdentifier)]) {
                 newBundleID = [app bundleIdentifier];
             }
@@ -293,20 +297,24 @@ static NSString * GetPrefPath() {
 
 // 修复 iOS 15 核心拦截点：抛弃之前的 activateShortcut...，直接拦截触发实例方法
 - (BOOL)shouldActivateApplicationShortcutItem:(id)item atIndex:(NSUInteger)index {
-    if ([item respondsToSelector:@selector(type)] && [[item type] isEqualToString:@"com.iosdump.appmute.toggle"]) {
-        SBIcon *icon = self.icon;
-        if ([icon respondsToSelector:@selector(applicationBundleID)]) {
-            NSString *bundleID = [icon applicationBundleID];
-            if (bundleID) {
-                // 1. 切换并保存状态
-                [[AppMuteManager sharedManager] toggleMute:bundleID];
-                // 2. 给予震动反馈
-                UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
-                [feedback impactOccurred];
+    // 修复了类型推断导致的编译错误
+    if ([item respondsToSelector:@selector(type)]) {
+        NSString *itemType = [(SBSApplicationShortcutItem *)item type];
+        if ([itemType isKindOfClass:[NSString class]] && [itemType isEqualToString:@"com.iosdump.appmute.toggle"]) {
+            SBIcon *icon = self.icon;
+            if ([icon respondsToSelector:@selector(applicationBundleID)]) {
+                NSString *bundleID = [icon applicationBundleID];
+                if (bundleID) {
+                    // 1. 切换并保存状态
+                    [[AppMuteManager sharedManager] toggleMute:bundleID];
+                    // 2. 给予震动反馈
+                    UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
+                    [feedback impactOccurred];
+                }
             }
+            // 返回 NO 明确阻断系统将其交给 App 处理
+            return NO;
         }
-        // 返回 NO 明确阻断系统将其交给 App 处理
-        return NO;
     }
     return %orig;
 }
