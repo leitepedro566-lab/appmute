@@ -1,9 +1,9 @@
 Package: com.iosdump.appmute
-Name: AppMute (启动静音)
+Name: AppMute
 Depends: mobilesubstrate
-Version: 1.0.0
+Version: 0.0.1
 Architecture: iphoneos-arm
-Description: iOS 14-17 桌面长按图标快捷添加“启动静音”开关，打开该App时自动将音量调至0，且彻底隐藏系统音量进度条(HUD)。
+Description: 支持iOS14-17桌面长按图标快捷开启启动应用自动静音媒体音量开关。
 Maintainer: iosdump
 Author: iosdump
 Section: Tweaks
