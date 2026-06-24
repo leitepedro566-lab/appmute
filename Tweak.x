@@ -40,6 +40,7 @@
 + (instancetype)sharedInstance;
 + (instancetype)sharedInstanceIfExists; 
 @property (nonatomic, assign) BOOL suppressHUD;
+- (void)setSuppressHUD:(BOOL)hud;
 @end
 
 @interface SpringBoard : UIApplication
@@ -47,8 +48,6 @@
 
 
 // ================== 全局数据与状态管理 ==================
-static BOOL g_isMutingHUD = NO;
-
 static NSString * GetPrefPath() {
     NSString *base = @"/var/mobile/Library/Preferences/com.iosdump.appmute.plist";
 #if __has_include(<roothide.h>)
@@ -114,6 +113,7 @@ static NSString * GetPrefPath() {
     [self save];
 }
 
+// 安全隐藏音量 HUD
 - (void)suppressMediaHUD:(BOOL)suppress {
     id mediaCtrl = nil;
     if ([%c(SBMediaController) respondsToSelector:@selector(sharedInstanceIfExists)]) {
@@ -126,65 +126,60 @@ static NSString * GetPrefPath() {
     }
 }
 
-// 开启媒体通道静音
+// 开启媒体静音 (仅限控制中心媒体音量)
 - (void)performVolumeChangeToMute {
-    g_isMutingHUD = YES;
     [self suppressMediaHUD:YES];
     
     AVSystemController *avCtrl = [%c(AVSystemController) sharedAVSystemController];
     if (avCtrl) {
-        // 仅覆盖 Audio/Video（映射控制中心媒体音量），绝不影响 Ringtone（铃声）等通道
-        NSArray *categories = @[@"Audio/Video"];
+        // 【关键修改】仅接管 Audio/Video（媒体音量），绝对不会影响 Ringtone（铃声/闹钟）
+        NSString *cat = @"Audio/Video";
         
         if (!self.savedVolumes) self.savedVolumes = [NSMutableDictionary dictionary];
         
-        for (NSString *cat in categories) {
-            float vol = 0.0;
-            if ([avCtrl respondsToSelector:@selector(getVolume:forCategory:)]) {
-                [avCtrl getVolume:&vol forCategory:cat];
-                if (vol > 0.01) {
-                    self.savedVolumes[cat] = @(vol);
-                }
+        float vol = 0.0;
+        if ([avCtrl respondsToSelector:@selector(getVolume:forCategory:)]) {
+            [avCtrl getVolume:&vol forCategory:cat];
+            if (vol > 0.01) {
+                self.savedVolumes[cat] = @(vol);
             }
-            if ([avCtrl respondsToSelector:@selector(setVolumeTo:forCategory:)]) {
-                [avCtrl setVolumeTo:0.0 forCategory:cat];
-            }
+        }
+        
+        if ([avCtrl respondsToSelector:@selector(setVolumeTo:forCategory:)]) {
+            [avCtrl setVolumeTo:0.0 forCategory:cat];
         }
     }
     
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        g_isMutingHUD = NO;
         [self suppressMediaHUD:NO];
     });
 }
 
-// 恢复媒体通道音量
+// 恢复媒体音量
 - (void)performVolumeRestore {
-    g_isMutingHUD = YES;
     [self suppressMediaHUD:YES];
     
     AVSystemController *avCtrl = [%c(AVSystemController) sharedAVSystemController];
     if (avCtrl) {
-        NSArray *categories = @[@"Audio/Video"];
-        for (NSString *cat in categories) {
-            float vol = 0.5; // 兜底安全音量
-            if (self.savedVolumes[cat]) {
-                vol = [self.savedVolumes[cat] floatValue];
-            }
-            if ([avCtrl respondsToSelector:@selector(setVolumeTo:forCategory:)]) {
-                [avCtrl setVolumeTo:vol forCategory:cat];
-            }
+        NSString *cat = @"Audio/Video";
+        float vol = 0.5; // 兜底音量
+        
+        if (self.savedVolumes[cat]) {
+            vol = [self.savedVolumes[cat] floatValue];
+        }
+        
+        if ([avCtrl respondsToSelector:@selector(setVolumeTo:forCategory:)]) {
+            [avCtrl setVolumeTo:vol forCategory:cat];
         }
         [self.savedVolumes removeAllObjects];
     }
     
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        g_isMutingHUD = NO;
         [self suppressMediaHUD:NO];
     });
 }
 
-// 核心：处理 App 进入前台
+// 处理 App 进入前台
 - (void)processAppForeground:(NSString *)bundleID {
     if (!bundleID || bundleID.length == 0) return;
     self.lastFrontmostBundleID = bundleID;
@@ -202,13 +197,13 @@ static NSString * GetPrefPath() {
     }
 }
 
-// 核心：处理 App 退居后台 / 被销毁
+// 处理 App 退居后台
 - (void)processAppBackground:(NSString *)bundleID {
     if (!bundleID || bundleID.length == 0) return;
     
     if ([self.lastFrontmostBundleID isEqualToString:bundleID] && self.isCurrentlyMuted) {
         self.isCurrentlyMuted = NO;
-        self.lastFrontmostBundleID = @"";
+        self.lastFrontmostBundleID = @""; 
         [self performVolumeRestore];
     }
 }
@@ -241,9 +236,10 @@ static NSString * GetPrefPath() {
     SBSApplicationShortcutSystemIcon *sysIcon = [[%c(SBSApplicationShortcutSystemIcon) alloc] initWithSystemImageName: isMuted ? @"speaker.slash.fill" : @"speaker.wave.2.fill"];
     item.icon = sysIcon;
     
+    // 【关键修改】确保返回的是安全的不可变数组
     NSMutableArray *mutOrig = orig ? [orig mutableCopy] : [NSMutableArray array];
     [mutOrig addObject:item];
-    return mutOrig;
+    return [mutOrig copy];
 }
 @end
 
@@ -253,10 +249,6 @@ static NSString * GetPrefPath() {
 %hook SBIconView
 
 - (NSArray *)applicationShortcutItems {
-    return [[AppMuteManager sharedManager] addShortcutToItems:%orig forIcon:self.icon];
-}
-
-- (NSArray *)effectiveApplicationShortcutItems {
     return [[AppMuteManager sharedManager] addShortcutToItems:%orig forIcon:self.icon];
 }
 
@@ -284,104 +276,82 @@ static NSString * GetPrefPath() {
 
 
 // ───────────────────────────────────────────
-//  [超强引擎] iOS 14-17 FrontBoard Scene 生命周期拦截
+//  [超强安全引擎] 拦截生命周期
 // ───────────────────────────────────────────
 %hook SBMainDisplaySceneManager
 
 - (void)_noteDidChangeToVisibility:(unsigned long long)visibility previouslyExisted:(_Bool)existed forScene:(id)scene {
     %orig;
-    @try {
-        if ([scene respondsToSelector:@selector(clientProcess)]) {
-            id process = [scene valueForKey:@"clientProcess"];
-            if (process) {
-                NSString *bundleID = [process valueForKey:@"bundleIdentifier"];
-                if (bundleID && [bundleID isKindOfClass:[NSString class]]) {
-                    if (visibility == 2) {
-                        [[AppMuteManager sharedManager] processAppForeground:bundleID];
-                    } else if (visibility == 0 || visibility == 1) {
-                        [[AppMuteManager sharedManager] processAppBackground:bundleID];
-                    }
+    
+    // 【关键修改 1】必须包裹在主线程执行，防止底层 AVSystemController 在后台线程访问引发崩溃
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            // 【关键修改 2】利用你的头文件方法：精确过滤掉键盘、小组件等系统干扰 Scene，大幅降低运算负担
+            if ([self respondsToSelector:@selector(_isExternalForegroundScene:)]) {
+                if (![self _isExternalForegroundScene:scene]) {
+                    return; // 不是前台独立 App 则忽略
                 }
             }
+            
+            // 【关键修改 3】弃用高风险的 valueForKey 字典方式，改用安全的对象提取
+            id process = nil;
+            if ([scene respondsToSelector:@selector(clientProcess)]) {
+                process = [scene performSelector:@selector(clientProcess)];
+            }
+            
+            NSString *bundleID = nil;
+            if (process && [process respondsToSelector:@selector(bundleIdentifier)]) {
+                bundleID = [process performSelector:@selector(bundleIdentifier)];
+            }
+            
+            if (bundleID && [bundleID isKindOfClass:[NSString class]]) {
+                // FBSSceneVisibility: 2=前台可见, 0=销毁/未追踪, 1=后台
+                if (visibility == 2) {
+                    [[AppMuteManager sharedManager] processAppForeground:bundleID];
+                } else if (visibility == 0 || visibility == 1) {
+                    [[AppMuteManager sharedManager] processAppBackground:bundleID];
+                }
+            }
+        } @catch (NSException *e) {
+            // 彻底隔离异常，绝不拖累 SpringBoard
         }
-    } @catch (NSException *e) {}
+    });
 }
 %end
 
 
 // ───────────────────────────────────────────
-//  [安全底线] 经典 SpringBoard 通知
+//  [安全底线] 兜底回退机制
 // ───────────────────────────────────────────
 %hook SpringBoard
 
 - (void)frontDisplayDidChange:(id)change {
     %orig;
-    @try {
-        NSString *newBundleID = nil;
-        if (change) {
-            if ([change respondsToSelector:@selector(applicationBundleID)]) {
-                newBundleID = [change performSelector:@selector(applicationBundleID)];
-            } else if ([change respondsToSelector:@selector(bundleIdentifier)]) {
-                newBundleID = [change performSelector:@selector(bundleIdentifier)];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            NSString *newBundleID = nil;
+            if (change) {
+                if ([change respondsToSelector:@selector(applicationBundleID)]) {
+                    newBundleID = [change performSelector:@selector(applicationBundleID)];
+                } else if ([change respondsToSelector:@selector(bundleIdentifier)]) {
+                    newBundleID = [change performSelector:@selector(bundleIdentifier)];
+                }
+            }
+            
+            if (newBundleID) {
+                [[AppMuteManager sharedManager] processAppForeground:newBundleID];
             } else {
-                id app = [change valueForKey:@"application"];
-                if ([app respondsToSelector:@selector(bundleIdentifier)]) {
-                    newBundleID = [app performSelector:@selector(bundleIdentifier)];
-                }
+                [[AppMuteManager sharedManager] processAppBackground:[AppMuteManager sharedManager].lastFrontmostBundleID];
             }
-        }
-        
-        if (!newBundleID) {
-            if ([self respondsToSelector:@selector(_accessibilityFrontMostApplication)]) {
-                id app = [self performSelector:@selector(_accessibilityFrontMostApplication)];
-                newBundleID = [app performSelector:@selector(bundleIdentifier)];
-            }
-        }
-        
-        if (newBundleID) {
-            [[AppMuteManager sharedManager] processAppForeground:newBundleID];
-        } else {
-            [[AppMuteManager sharedManager] processAppBackground:[AppMuteManager sharedManager].lastFrontmostBundleID];
-        }
-    } @catch (NSException *e) {}
-}
-
-- (void)_handleApplicationProcessStateDidChangeNotification:(NSNotification *)notification {
-    %orig;
-    @try {
-        if ([self respondsToSelector:@selector(_accessibilityFrontMostApplication)]) {
-            id app = [self performSelector:@selector(_accessibilityFrontMostApplication)];
-            if (app) {
-                NSString *bundleID = [app performSelector:@selector(bundleIdentifier)];
-                if (bundleID) {
-                    [[AppMuteManager sharedManager] processAppForeground:bundleID];
-                }
-            }
-        }
-    } @catch (NSException *e) {}
-}
-%end
-
-
-// ───────────────────────────────────────────
-//  阻止 HUD 弹出的双保险
-// ───────────────────────────────────────────
-%hook SBVolumeControl
-- (void)_presentVolumeHUDWithVolume:(float)volume {
-    if (g_isMutingHUD) return;
-    %orig;
-}
-
-// 仅 iOS 14-15 存在此方法，在 16-17 中 Logos 注入时会自动忽略，不会造成任何崩溃
-- (void)_presentVolumeHUDIfDisplayable:(BOOL)displayable orRefreshIfPresentedWithReason:(id)reason {
-    if (g_isMutingHUD) return;
-    %orig;
+        } @catch (NSException *e) {}
+    });
 }
 %end
 
 // ================== 初始化构造 ==================
 %ctor {
     @autoreleasepool {
+        // 在启动时预加载配置，确保不会阻塞主队列
         [AppMuteManager sharedManager];
     }
 }
