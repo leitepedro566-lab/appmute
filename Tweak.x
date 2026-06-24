@@ -64,7 +64,7 @@ static NSString * GetPrefPath() {
 @interface AppMuteManager : NSObject
 @property (nonatomic, strong) NSMutableArray *mutedBundleIDs;
 @property (nonatomic, copy) NSString *lastFrontmostBundleID;
-@property (nonatomic, strong) NSMutableDictionary *savedVolumes; // 多通道音量记忆缓存
+@property (nonatomic, strong) NSMutableDictionary *savedVolumes; // 音量记忆缓存
 @property (nonatomic, assign) BOOL isCurrentlyMuted;
 + (instancetype)sharedManager;
 - (NSArray *)addShortcutToItems:(NSArray *)orig forIcon:(SBIcon *)icon;
@@ -126,15 +126,15 @@ static NSString * GetPrefPath() {
     }
 }
 
-// 开启全局通道静音
+// 开启静音（仅限媒体通道）
 - (void)performVolumeChangeToMute {
     g_isMutingHUD = YES;
     [self suppressMediaHUD:YES];
     
     AVSystemController *avCtrl = [%c(AVSystemController) sharedAVSystemController];
     if (avCtrl) {
-        // 覆盖所有可能发声的底层通道（彻底解决相机、设置等系统 App 不静音的问题）
-        NSArray *categories = @[@"Audio/Video", @"Media", @"Ringtone", @"System", @"Alarm", @"Ambient", @"PhoneCall"];
+        // 仅处理媒体音量，剔除铃声(Ringtone)和系统音(System/Alarm)
+        NSArray *categories = @[@"Audio/Video", @"Media"];
         
         if (!self.savedVolumes) self.savedVolumes = [NSMutableDictionary dictionary];
         
@@ -160,14 +160,14 @@ static NSString * GetPrefPath() {
     });
 }
 
-// 恢复全局通道音量
+// 恢复音量（仅限媒体通道）
 - (void)performVolumeRestore {
     g_isMutingHUD = YES;
     [self suppressMediaHUD:YES];
     
     AVSystemController *avCtrl = [%c(AVSystemController) sharedAVSystemController];
     if (avCtrl) {
-        NSArray *categories = @[@"Audio/Video", @"Media", @"Ringtone", @"System", @"Alarm", @"Ambient", @"PhoneCall"];
+        NSArray *categories = @[@"Audio/Video", @"Media"];
         for (NSString *cat in categories) {
             float vol = 0.5; // 兜底安全音量
             if (self.savedVolumes[cat]) {
