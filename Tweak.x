@@ -46,6 +46,11 @@
 @interface SpringBoard : UIApplication
 @end
 
+// 【修复编译错误的核心】显式声明 SceneManager 及其私有方法
+@interface SBMainDisplaySceneManager : NSObject
+- (BOOL)_isExternalForegroundScene:(id)scene;
+@end
+
 
 // ================== 全局数据与状态管理 ==================
 static NSString * GetPrefPath() {
@@ -132,7 +137,7 @@ static NSString * GetPrefPath() {
     
     AVSystemController *avCtrl = [%c(AVSystemController) sharedAVSystemController];
     if (avCtrl) {
-        // 【关键修改】仅接管 Audio/Video（媒体音量），绝对不会影响 Ringtone（铃声/闹钟）
+        // 仅接管 Audio/Video（媒体音量），绝对不会影响 Ringtone（铃声/闹钟）
         NSString *cat = @"Audio/Video";
         
         if (!self.savedVolumes) self.savedVolumes = [NSMutableDictionary dictionary];
@@ -236,7 +241,6 @@ static NSString * GetPrefPath() {
     SBSApplicationShortcutSystemIcon *sysIcon = [[%c(SBSApplicationShortcutSystemIcon) alloc] initWithSystemImageName: isMuted ? @"speaker.slash.fill" : @"speaker.wave.2.fill"];
     item.icon = sysIcon;
     
-    // 【关键修改】确保返回的是安全的不可变数组
     NSMutableArray *mutOrig = orig ? [orig mutableCopy] : [NSMutableArray array];
     [mutOrig addObject:item];
     return [mutOrig copy];
@@ -283,17 +287,16 @@ static NSString * GetPrefPath() {
 - (void)_noteDidChangeToVisibility:(unsigned long long)visibility previouslyExisted:(_Bool)existed forScene:(id)scene {
     %orig;
     
-    // 【关键修改 1】必须包裹在主线程执行，防止底层 AVSystemController 在后台线程访问引发崩溃
+    // 必须包裹在主线程执行，防止底层 AVSystemController 在后台线程访问引发崩溃
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
-            // 【关键修改 2】利用你的头文件方法：精确过滤掉键盘、小组件等系统干扰 Scene，大幅降低运算负担
+            // 精确过滤掉键盘、小组件等系统干扰 Scene，大幅降低运算负担
             if ([self respondsToSelector:@selector(_isExternalForegroundScene:)]) {
                 if (![self _isExternalForegroundScene:scene]) {
                     return; // 不是前台独立 App 则忽略
                 }
             }
             
-            // 【关键修改 3】弃用高风险的 valueForKey 字典方式，改用安全的对象提取
             id process = nil;
             if ([scene respondsToSelector:@selector(clientProcess)]) {
                 process = [scene performSelector:@selector(clientProcess)];
